@@ -1,572 +1,469 @@
-# -*- coding: utf-8 -*-
-"""
-LibraryContent: The XBlock used to include blocks from a library in a course.
-"""
-import json
-from lxml import etree
-from copy import copy
-from capa.responsetypes import registry
-from gettext import ngettext
-from lazy import lazy
+from __future__ import absolute_import
 
-from .mako_module import MakoModuleDescriptor
-from opaque_keys.edx.locator import LibraryLocator
-import random
-from webob import Response
+import logging
+
+from django.conf import settings
+from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
+from django.http import Http404, HttpResponseBadRequest
+from django.utils.translation import ugettext as _
+from django.views.decorators.http import require_GET
+from opaque_keys import InvalidKeyError
+from opaque_keys.edx.asides import AsideUsageKeyV1, AsideUsageKeyV2
+from opaque_keys.edx.keys import UsageKey
 from xblock.core import XBlock
-from xblock.fields import Scope, String, List, Integer, Boolean
-from xblock.fragment import Fragment
-from xmodule.validation import StudioValidationMessage, StudioValidation
-from xmodule.x_module import XModule, STUDENT_VIEW
-from xmodule.studio_editable import StudioEditableModule, StudioEditableDescriptor
-from .xml_module import XmlDescriptor
-from pkg_resources import resource_string  # pylint: disable=no-name-in-module
+from xblock.django.request import django_to_webob_request, webob_to_django_response
+from xblock.exceptions import NoSuchHandlerError
+from xblock.plugin import PluginMissingError
+from xblock.runtime import Mixologist
+
+from contentstore.utils import get_lms_link_for_item, get_xblock_aside_instance, reverse_course_url
+from contentstore.views.helpers import get_parent_xblock, is_unit, xblock_type_display_name
+from contentstore.views.item import StudioEditModuleRuntime, add_container_page_publishing_info, create_xblock_info
+from edxmako.shortcuts import render_to_response
+from student.auth import has_course_author_access
+from xblock_django.api import authorable_xblocks, disabled_xblocks
+from xblock_django.models import XBlockStudioConfigurationFlag
+from xmodule.modulestore.django import modulestore
+from xmodule.modulestore.exceptions import ItemNotFoundError
+
+__all__ = [
+    'container_handler',
+    'component_handler'
+]
+
+log = logging.getLogger(__name__)
+
+# NOTE: This list is disjoint from ADVANCED_COMPONENT_TYPES
+COMPONENT_TYPES = ['discussion', 'html', 'problem', 'video']
+
+ADVANCED_COMPONENT_TYPES = sorted(set(name for name, class_ in XBlock.load_classes()) - set(COMPONENT_TYPES))
+
+ADVANCED_PROBLEM_TYPES = settings.ADVANCED_PROBLEM_TYPES
+
+CONTAINER_TEMPLATES = [
+    "basic-modal", "modal-button", "edit-xblock-modal",
+    "editor-mode-button", "upload-dialog",
+    "add-xblock-component", "add-xblock-component-button", "add-xblock-component-menu",
+    "add-xblock-component-support-legend", "add-xblock-component-support-level", "add-xblock-component-menu-problem",
+    "xblock-string-field-editor", "xblock-access-editor", "publish-xblock", "publish-history",
+    "unit-outline", "container-message", "container-access", "license-selector",
+]
 
 
-# Make '_' a no-op so we can scrape strings
-_ = lambda text: text
-
-
-ANY_CAPA_TYPE_VALUE = 'any'
-
-
-def _get_human_name(problem_class):
+def _advanced_component_types(show_unsupported):
     """
-    Get the human-friendly name for a problem type.
-    """
-    return getattr(problem_class, 'human_name', problem_class.__name__)
+    Return advanced component types which can be created.
 
+    Args:
+        show_unsupported: if True, unsupported XBlocks may be included in the return value
 
-def _get_capa_types():
-    """
-    Gets capa types tags and labels
-    """
-    capa_types = {tag: _get_human_name(registry.get_class_for_tag(tag)) for tag in registry.registered_tags()}
-
-    return [{'value': ANY_CAPA_TYPE_VALUE, 'display_name': _('Any Type')}] + sorted([
-        {'value': capa_type, 'display_name': caption}
-        for capa_type, caption in capa_types.items()
-    ], key=lambda item: item.get('display_name'))
-
-
-class LibraryContentFields(object):
-    """
-    Fields for the LibraryContentModule.
-
-    Separated out for now because they need to be added to the module and the
-    descriptor.
-    """
-    # Please note the display_name of each field below is used in
-    # common/test/acceptance/pages/studio/library.py:StudioLibraryContentXBlockEditModal
-    # to locate input elements - keep synchronized
-    display_name = String(
-        display_name=_("Display Name"),
-        help=_("Display name for this module"),
-        default="Randomized Content Block",
-        scope=Scope.settings,
-    )
-    source_library_id = String(
-        display_name=_("Library"),
-        help=_("Select the library from which you want to draw content."),
-        scope=Scope.settings,
-        values_provider=lambda instance: instance.source_library_values(),
-    )
-    source_library_version = String(
-        # This is a hidden field that stores the version of source_library when we last pulled content from it
-        display_name=_("Library Version"),
-        scope=Scope.settings,
-    )
-    mode = String(
-        display_name=_("Mode"),
-        help=_("Determines how content is drawn from the library"),
-        default="random",
-        values=[
-            {"display_name": _("Choose n at random"), "value": "random"}
-            # Future addition: Choose a new random set of n every time the student refreshes the block, for self tests
-            # Future addition: manually selected blocks
-        ],
-        scope=Scope.settings,
-    )
-    max_count = Integer(
-        display_name=_("Count"),
-        help=_("Enter the number of components to display to each student."),
-        default=1,
-        scope=Scope.settings,
-    )
-    capa_type = String(
-        display_name=_("Problem Type"),
-        help=_('Choose a problem type to fetch from the library. If "Any Type" is selected no filtering is applied.'),
-        default=ANY_CAPA_TYPE_VALUE,
-        values=_get_capa_types(),
-        scope=Scope.settings,
-    )
-    filters = String(default="")  # TBD
-    has_score = Boolean(
-        display_name=_("Scored"),
-        help=_("Set this value to True if this module is either a graded assignment or a practice problem."),
-        default=False,
-        scope=Scope.settings,
-    )
-    selected = List(
-        # This is a list of (block_type, block_id) tuples used to record
-        # which random/first set of matching blocks was selected per user
-        default=[],
-        scope=Scope.user_state,
-    )
-    has_children = True
-
-    @property
-    def source_library_key(self):
-        """
-        Convenience method to get the library ID as a LibraryLocator and not just a string
-        """
-        return LibraryLocator.from_string(self.source_library_id)
-
-
-#pylint: disable=abstract-method
-@XBlock.wants('library_tools')  # Only needed in studio
-class LibraryContentModule(LibraryContentFields, XModule, StudioEditableModule):
-    """
-    An XBlock whose children are chosen dynamically from a content library.
-    Can be used to create randomized assessments among other things.
-
-    Note: technically, all matching blocks from the content library are added
-    as children of this block, but only a subset of those children are shown to
-    any particular student.
-    """
-
-    def _publish_event(self, event_name, result, **kwargs):
-        """ Helper method to publish an event for analytics purposes """
-        event_data = {
-            "location": unicode(self.location),
-            "result": result,
-            "previous_count": getattr(self, "_last_event_result_count", len(self.selected)),
-            "max_count": self.max_count,
+    Returns:
+        A dict of authorable XBlock types and their support levels (see XBlockStudioConfiguration). For example:
+        {
+            "done": "us",  # unsupported
+            "discussion: "fs"  # fully supported
         }
-        event_data.update(kwargs)
-        self.runtime.publish(self, "edx.librarycontentblock.content.{}".format(event_name), event_data)
-        self._last_event_result_count = len(result)  # pylint: disable=attribute-defined-outside-init
-
-    def selected_children(self):
-        """
-        Returns a set() of block_ids indicating which of the possible children
-        have been selected to display to the current user.
-
-        This reads and updates the "selected" field, which has user_state scope.
-
-        Note: self.selected and the return value contain block_ids. To get
-        actual BlockUsageLocators, it is necessary to use self.children,
-        because the block_ids alone do not specify the block type.
-        """
-        if hasattr(self, "_selected_set"):
-            # Already done:
-            return self._selected_set  # pylint: disable=access-member-before-definition
-
-        selected = set(tuple(k) for k in self.selected)  # set of (block_type, block_id) tuples assigned to this student
-
-        lib_tools = self.runtime.service(self, 'library_tools')
-        format_block_keys = lambda keys: lib_tools.create_block_analytics_summary(self.location.course_key, keys)
-
-        # Determine which of our children we will show:
-        valid_block_keys = set([(c.block_type, c.block_id) for c in self.children])  # pylint: disable=no-member
-        # Remove any selected blocks that are no longer valid:
-        invalid_block_keys = (selected - valid_block_keys)
-        if invalid_block_keys:
-            selected -= invalid_block_keys
-            # Publish an event for analytics purposes:
-            # reason "invalid" means deleted from library or a different library is now being used.
-            self._publish_event(
-                "removed",
-                result=format_block_keys(selected),
-                removed=format_block_keys(invalid_block_keys),
-                reason="invalid"
-            )
-        # If max_count has been decreased, we may have to drop some previously selected blocks:
-        overlimit_block_keys = set()
-        while len(selected) > self.max_count:
-            overlimit_block_keys.add(selected.pop())
-        if overlimit_block_keys:
-            # Publish an event for analytics purposes:
-            self._publish_event(
-                "removed",
-                result=format_block_keys(selected),
-                removed=format_block_keys(overlimit_block_keys),
-                reason="overlimit"
-            )
-        # Do we have enough blocks now?
-        num_to_add = self.max_count - len(selected)
-        if num_to_add > 0:
-            added_block_keys = None
-            # We need to select [more] blocks to display to this user:
-            pool = valid_block_keys - selected
-            if self.mode == "random":
-                num_to_add = min(len(pool), num_to_add)
-                added_block_keys = set(random.sample(pool, num_to_add))
-                # We now have the correct n random children to show for this user.
-            else:
-                raise NotImplementedError("Unsupported mode.")
-            selected |= added_block_keys
-            if added_block_keys:
-                # Publish an event for analytics purposes:
-                self._publish_event(
-                    "assigned",
-                    result=format_block_keys(selected),
-                    added=format_block_keys(added_block_keys)
-                )
-        # Save our selections to the user state, to ensure consistency:
-        self.selected = list(selected)  # TODO: this doesn't save from the LMS "Progress" page.
-        # Cache the results
-        self._selected_set = selected  # pylint: disable=attribute-defined-outside-init
-        return selected
-
-    def _get_selected_child_blocks(self):
-        """
-        Generator returning XBlock instances of the children selected for the
-        current user.
-        """
-        for block_type, block_id in self.selected_children():
-            yield self.runtime.get_block(self.location.course_key.make_usage_key(block_type, block_id))
-
-    def student_view(self, context):
-        fragment = Fragment()
-        contents = []
-        child_context = {} if not context else copy(context)
-
-        for child in self._get_selected_child_blocks():
-            for displayable in child.displayable_items():
-                rendered_child = displayable.render(STUDENT_VIEW, child_context)
-                fragment.add_frag_resources(rendered_child)
-                contents.append({
-                    'id': displayable.location.to_deprecated_string(),
-                    'content': rendered_child.content,
-                })
-
-        fragment.add_content(self.system.render_template('vert_module.html', {
-            'items': contents,
-            'xblock_context': context,
-        }))
-        return fragment
-
-    def validate(self):
-        """
-        Validates the state of this Library Content Module Instance.
-        """
-        return self.descriptor.validate()
-
-    def author_view(self, context):
-        """
-        Renders the Studio views.
-        Normal studio view: If block is properly configured, displays library status summary
-        Studio container view: displays a preview of all possible children.
-        """
-        fragment = Fragment()
-        root_xblock = context.get('root_xblock')
-        is_root = root_xblock and root_xblock.location == self.location
-
-        if is_root:
-            # User has clicked the "View" link. Show a preview of all possible children:
-            if self.children:  # pylint: disable=no-member
-                fragment.add_content(self.system.render_template("library-block-author-preview-header.html", {
-                    'max_count': self.max_count,
-                    'display_name': self.display_name or self.url_name,
-                }))
-                context['can_edit_visibility'] = False
-                self.render_children(context, fragment, can_reorder=False, can_add=False)
-        # else: When shown on a unit page, don't show any sort of preview -
-        # just the status of this block in the validation area.
-
-        # The following JS is used to make the "Update now" button work on the unit page and the container view:
-        fragment.add_javascript_url(self.runtime.local_resource_url(self, 'public/js/library_content_edit.js'))
-        fragment.initialize_js('LibraryContentAuthorView')
-        return fragment
-
-    def get_child_descriptors(self):
-        """
-        Return only the subset of our children relevant to the current student.
-        """
-        return list(self._get_selected_child_blocks())
-
-
-@XBlock.wants('user')
-@XBlock.wants('library_tools')  # Only needed in studio
-@XBlock.wants('studio_user_permissions')  # Only available in studio
-class LibraryContentDescriptor(LibraryContentFields, MakoModuleDescriptor, XmlDescriptor, StudioEditableDescriptor):
+        Note that the support level will be "True" for all XBlocks if XBlockStudioConfigurationFlag
+        is not enabled.
     """
-    Descriptor class for LibraryContentModule XBlock.
+    enabled_block_types = _filter_disabled_blocks(ADVANCED_COMPONENT_TYPES)
+    if XBlockStudioConfigurationFlag.is_enabled():
+        authorable_blocks = authorable_xblocks(allow_unsupported=show_unsupported)
+        filtered_blocks = {}
+        for block in authorable_blocks:
+            if block.name in enabled_block_types:
+                filtered_blocks[block.name] = block.support_level
+        return filtered_blocks
+    else:
+        all_blocks = {}
+        for block_name in enabled_block_types:
+            all_blocks[block_name] = True
+        return all_blocks
+
+
+def _load_mixed_class(category):
     """
-    module_class = LibraryContentModule
-    mako_template = 'widgets/metadata-edit.html'
-    js = {'coffee': [resource_string(__name__, 'js/src/vertical/edit.coffee')]}
-    js_module_name = "VerticalDescriptor"
+    Load an XBlock by category name, and apply all defined mixins
+    """
+    component_class = XBlock.load_class(category, select=settings.XBLOCK_SELECT_FUNCTION)
+    mixologist = Mixologist(settings.XBLOCK_MIXINS)
+    return mixologist.mix(component_class)
 
-    @property
-    def non_editable_metadata_fields(self):
-        non_editable_fields = super(LibraryContentDescriptor, self).non_editable_metadata_fields
-        # The only supported mode is currently 'random'.
-        # Add the mode field to non_editable_metadata_fields so that it doesn't
-        # render in the edit form.
-        non_editable_fields.extend([LibraryContentFields.mode, LibraryContentFields.source_library_version])
-        return non_editable_fields
 
-    @lazy
-    def tools(self):
-        """
-        Grab the library tools service or raise an error.
-        """
-        return self.runtime.service(self, 'library_tools')
+@require_GET
+@login_required
+def container_handler(request, usage_key_string):
+    """
+    The restful handler for container xblock requests.
 
-    def get_user_id(self):
-        """
-        Get the ID of the current user.
-        """
-        user_service = self.runtime.service(self, 'user')
-        if user_service:
-            # May be None when creating bok choy test fixtures
-            user_id = user_service.get_current_user().opt_attrs.get('edx-platform.user_id', None)
-        else:
-            user_id = None
-        return user_id
+    GET
+        html: returns the HTML page for editing a container
+        json: not currently supported
+    """
+    if 'text/html' in request.META.get('HTTP_ACCEPT', 'text/html'):
 
-    @XBlock.handler
-    def refresh_children(self, request=None, suffix=None):  # pylint: disable=unused-argument
-        """
-        Refresh children:
-        This method is to be used when any of the libraries that this block
-        references have been updated. It will re-fetch all matching blocks from
-        the libraries, and copy them as children of this block. The children
-        will be given new block_ids, but the definition ID used should be the
-        exact same definition ID used in the library.
-
-        This method will update this block's 'source_library_id' field to store
-        the version number of the libraries used, so we easily determine if
-        this block is up to date or not.
-        """
-        user_perms = self.runtime.service(self, 'studio_user_permissions')
-        user_id = self.get_user_id()
-        if not self.tools:
-            return Response("Library Tools unavailable in current runtime.", status=400)
-        self.tools.update_children(self, user_id, user_perms)
-        return Response()
-
-    # Copy over any overridden settings the course author may have applied to the blocks.
-    def _copy_overrides(self, store, user_id, source, dest):
-        """
-        Copy any overrides the user has made on blocks in this library.
-        """
-        for field in source.fields.itervalues():
-            if field.scope == Scope.settings and field.is_set_on(source):
-                setattr(dest, field.name, field.read_from(source))
-        if source.has_children:
-            source_children = [self.runtime.get_block(source_key) for source_key in source.children]
-            dest_children = [self.runtime.get_block(dest_key) for dest_key in dest.children]
-            for source_child, dest_child in zip(source_children, dest_children):
-                self._copy_overrides(store, user_id, source_child, dest_child)
-        store.update_item(dest, user_id)
-
-    def studio_post_duplicate(self, store, source_block):
-        """
-        Used by the studio after basic duplication of a source block. We handle the children
-        ourselves, because we have to properly reference the library upstream and set the overrides.
-
-        Otherwise we'll end up losing data on the next refresh.
-        """
-        # The first task will be to refresh our copy of the library to generate the children.
-        # We must do this at the currently set version of the library block. Otherwise we may not have
-        # exactly the same children-- someone may be duplicating an out of date block, after all.
-        user_id = self.get_user_id()
-        user_perms = self.runtime.service(self, 'studio_user_permissions')
-        # pylint: disable=no-member
-        if not self.tools:
-            raise RuntimeError("Library tools unavailable, duplication will not be sane!")
-        self.tools.update_children(self, user_id, user_perms, version=self.source_library_version)
-
-        self._copy_overrides(store, user_id, source_block, self)
-
-        # Children have been handled.
-        return True
-
-    def _validate_library_version(self, validation, lib_tools, version, library_key):
-        """
-        Validates library version
-        """
-        latest_version = lib_tools.get_library_version(library_key)
-        if latest_version is not None:
-            if version is None or version != unicode(latest_version):
-                validation.set_summary(
-                    StudioValidationMessage(
-                        StudioValidationMessage.WARNING,
-                        _(u'This component is out of date. The library has new content.'),
-                        # TODO: change this to action_runtime_event='...' once the unit page supports that feature.
-                        # See https://openedx.atlassian.net/browse/TNL-993
-                        action_class='library-update-btn',
-                        # Translators: {refresh_icon} placeholder is substituted to "↻" (without double quotes)
-                        action_label=_(u"{refresh_icon} Update now.").format(refresh_icon=u"↻")
-                    )
-                )
-                return False
-        else:
-            validation.set_summary(
-                StudioValidationMessage(
-                    StudioValidationMessage.ERROR,
-                    _(u'Library is invalid, corrupt, or has been deleted.'),
-                    action_class='edit-button',
-                    action_label=_(u"Edit Library List.")
-                )
-            )
-            return False
-        return True
-
-    def _set_validation_error_if_empty(self, validation, summary):
-        """  Helper method to only set validation summary if it's empty """
-        if validation.empty:
-            validation.set_summary(summary)
-
-    def validate(self):
-        """
-        Validates the state of this Library Content Module Instance. This
-        is the override of the general XBlock method, and it will also ask
-        its superclass to validate.
-        """
-        validation = super(LibraryContentDescriptor, self).validate()
-        if not isinstance(validation, StudioValidation):
-            validation = StudioValidation.copy(validation)
-        library_tools = self.runtime.service(self, "library_tools")
-        if not (library_tools and library_tools.can_use_library_content(self)):
-            validation.set_summary(
-                StudioValidationMessage(
-                    StudioValidationMessage.ERROR,
-                    _(
-                        u"This course does not support content libraries. "
-                        u"Contact your system administrator for more information."
-                    )
-                )
-            )
-            return validation
-        if not self.source_library_id:
-            validation.set_summary(
-                StudioValidationMessage(
-                    StudioValidationMessage.NOT_CONFIGURED,
-                    _(u"A library has not yet been selected."),
-                    action_class='edit-button',
-                    action_label=_(u"Select a Library.")
-                )
-            )
-            return validation
-        lib_tools = self.runtime.service(self, 'library_tools')
-        self._validate_library_version(validation, lib_tools, self.source_library_version, self.source_library_key)
-
-        # Note: we assume refresh_children() has been called
-        # since the last time fields like source_library_id or capa_types were changed.
-        matching_children_count = len(self.children)  # pylint: disable=no-member
-        if matching_children_count == 0:
-            self._set_validation_error_if_empty(
-                validation,
-                StudioValidationMessage(
-                    StudioValidationMessage.WARNING,
-                    _(u'There are no matching problem types in the specified libraries.'),
-                    action_class='edit-button',
-                    action_label=_(u"Select another problem type.")
-                )
-            )
-
-        if matching_children_count < self.max_count:
-            self._set_validation_error_if_empty(
-                validation,
-                StudioValidationMessage(
-                    StudioValidationMessage.WARNING,
-                    (
-                        ngettext(
-                            u'The specified library is configured to fetch {count} problem, ',
-                            u'The specified library is configured to fetch {count} problems, ',
-                            self.max_count
-                        ) +
-                        ngettext(
-                            u'but there is only {actual} matching problem.',
-                            u'but there are only {actual} matching problems.',
-                            matching_children_count
-                        )
-                    ).format(count=self.max_count, actual=matching_children_count),
-                    action_class='edit-button',
-                    action_label=_(u"Edit the library configuration.")
-                )
-            )
-
-        return validation
-
-    def source_library_values(self):
-        """
-        Return a list of possible values for self.source_library_id
-        """
-        lib_tools = self.runtime.service(self, 'library_tools')
-        user_perms = self.runtime.service(self, 'studio_user_permissions')
-        all_libraries = lib_tools.list_available_libraries()
-        if user_perms:
-            all_libraries = [
-                (key, name) for key, name in all_libraries
-                if user_perms.can_read(key) or self.source_library_id == unicode(key)
-            ]
-        all_libraries.sort(key=lambda entry: entry[1])  # Sort by name
-        if self.source_library_id and self.source_library_key not in [entry[0] for entry in all_libraries]:
-            all_libraries.append((self.source_library_id, _(u"Invalid Library")))
-        all_libraries = [(u"", _("No Library Selected"))] + all_libraries
-        values = [{"display_name": name, "value": unicode(key)} for key, name in all_libraries]
-        return values
-
-    def editor_saved(self, user, old_metadata, old_content):
-        """
-        If source_library_id or capa_type has been edited, refresh_children automatically.
-        """
-        old_source_library_id = old_metadata.get('source_library_id', [])
-        if (old_source_library_id != self.source_library_id or
-                old_metadata.get('capa_type', ANY_CAPA_TYPE_VALUE) != self.capa_type):
+        try:
+            usage_key = UsageKey.from_string(usage_key_string)
+        except InvalidKeyError:  # Raise Http404 on invalid 'usage_key_string'
+            raise Http404
+        with modulestore().bulk_operations(usage_key.course_key):
             try:
-                self.refresh_children()
-            except ValueError:
-                pass  # The validation area will display an error message, no need to do anything now.
+                course, xblock, lms_link, preview_lms_link = _get_item_in_course(request, usage_key)
+            except ItemNotFoundError:
+                return HttpResponseBadRequest()
 
-    def has_dynamic_children(self):
-        """
-        Inform the runtime that our children vary per-user.
-        See get_child_descriptors() above
-        """
-        return True
+            component_templates = get_component_templates(course)
+            ancestor_xblocks = []
+            parent = get_parent_xblock(xblock)
+            action = request.GET.get('action', 'view')
 
-    def get_content_titles(self):
-        """
-        Returns list of friendly titles for our selected children only; without
-        thi, all possible children's titles would be seen in the sequence bar in
-        the LMS.
+            is_unit_page = is_unit(xblock)
+            unit = xblock if is_unit_page else None
 
-        This overwrites the get_content_titles method included in x_module by default.
-        """
-        titles = []
-        for child in self._xmodule.get_child_descriptors():
-            titles.extend(child.get_content_titles())
-        return titles
+            while parent and parent.category != 'course':
+                if unit is None and is_unit(parent):
+                    unit = parent
+                ancestor_xblocks.append(parent)
+                parent = get_parent_xblock(parent)
+            ancestor_xblocks.reverse()
 
-    @classmethod
-    def definition_from_xml(cls, xml_object, system):
-        children = [
-            # pylint: disable=no-member
-            system.process_xml(etree.tostring(child)).scope_ids.usage_id
-            for child in xml_object.getchildren()
-        ]
-        definition = {
-            attr_name: json.loads(attr_value)
-            for attr_name, attr_value in xml_object.attrib
+            assert unit is not None, "Could not determine unit page"
+            subsection = get_parent_xblock(unit)
+            assert subsection is not None, "Could not determine parent subsection from unit " + unicode(unit.location)
+            section = get_parent_xblock(subsection)
+            assert section is not None, "Could not determine ancestor section from unit " + unicode(unit.location)
+
+            # Fetch the XBlock info for use by the container page. Note that it includes information
+            # about the block's ancestors and siblings for use by the Unit Outline.
+            xblock_info = create_xblock_info(xblock, include_ancestor_info=is_unit_page)
+
+            if is_unit_page:
+                add_container_page_publishing_info(xblock, xblock_info)
+
+            # need to figure out where this item is in the list of children as the
+            # preview will need this
+            index = 1
+            for child in subsection.get_children():
+                if child.location == unit.location:
+                    break
+                index += 1
+
+            return render_to_response('container.html', {
+                'language_code': request.LANGUAGE_CODE,
+                'context_course': course,  # Needed only for display of menus at top of page.
+                'action': action,
+                'xblock': xblock,
+                'xblock_locator': xblock.location,
+                'unit': unit,
+                'is_unit_page': is_unit_page,
+                'subsection': subsection,
+                'section': section,
+                'new_unit_category': 'vertical',
+                'outline_url': '{url}?format=concise'.format(url=reverse_course_url('course_handler', course.id)),
+                'ancestor_xblocks': ancestor_xblocks,
+                'component_templates': component_templates,
+                'xblock_info': xblock_info,
+                'draft_preview_link': preview_lms_link,
+                'published_preview_link': lms_link,
+                'templates': CONTAINER_TEMPLATES
+            })
+    else:
+        return HttpResponseBadRequest("Only supports HTML requests")
+
+
+def get_component_templates(courselike, library=False):
+    """
+    Returns the applicable component templates that can be used by the specified course or library.
+    """
+    def create_template_dict(name, category, support_level, boilerplate_name=None, tab="common", hinted=False):
+        """
+        Creates a component template dict.
+
+        Parameters
+            display_name: the user-visible name of the component
+            category: the type of component (problem, html, etc.)
+            support_level: the support level of this component
+            boilerplate_name: name of boilerplate for filling in default values. May be None.
+            hinted: True if hinted problem else False
+            tab: common(default)/advanced, which tab it goes in
+
+        """
+        return {
+            "display_name": name,
+            "category": category,
+            "boilerplate_name": boilerplate_name,
+            "hinted": hinted,
+            "tab": tab,
+            "support_level": support_level
         }
-        return definition, children
 
-    def definition_to_xml(self, resource_fs):
-        """ Exports Library Content Module to XML """
-        # pylint: disable=no-member
-        xml_object = etree.Element('library_content')
-        for child in self.get_children():
-            self.runtime.add_block_as_child_node(child, xml_object)
-        # Set node attributes based on our fields.
-        for field_name, field in self.fields.iteritems():
-            if field_name in ('children', 'parent', 'content'):
-                continue
-            if field.is_set_on(self):
-                xml_object.set(field_name, unicode(field.read_from(self)))
-        return xml_object
+    def component_support_level(editable_types, name, template=None):
+        """
+        Returns the support level for the given xblock name/template combination.
+
+        Args:
+            editable_types: a QuerySet of xblocks with their support levels
+            name: the name of the xblock
+            template: optional template for the xblock
+
+        Returns:
+            If XBlockStudioConfigurationFlag is enabled, returns the support level
+            (see XBlockStudioConfiguration) or False if this xblock name/template combination
+            has no Studio support at all. If XBlockStudioConfigurationFlag is disabled,
+            simply returns True.
+        """
+        # If the Studio support feature is disabled, return True for all.
+        if not XBlockStudioConfigurationFlag.is_enabled():
+            return True
+        if template is None:
+            template = ""
+        extension_index = template.rfind(".yaml")
+        if extension_index >= 0:
+            template = template[0:extension_index]
+        for block in editable_types:
+            if block.name == name and block.template == template:
+                return block.support_level
+
+        return False
+
+    def create_support_legend_dict():
+        """
+        Returns a dict of settings information for the display of the support level legend.
+        """
+        return {
+            "show_legend": XBlockStudioConfigurationFlag.is_enabled(),
+            "allow_unsupported_xblocks": allow_unsupported,
+            "documentation_label": _("{platform_name} Support Levels:").format(platform_name=settings.PLATFORM_NAME)
+        }
+
+    component_display_names = {
+        'discussion': _("Discussion"),
+        'html': _("HTML"),
+        'problem': _("Problem"),
+        'video': _("Video")
+    }
+
+    component_templates = []
+    categories = set()
+    # The component_templates array is in the order of "advanced" (if present), followed
+    # by the components in the order listed in COMPONENT_TYPES.
+    component_types = COMPONENT_TYPES[:]
+
+    # Libraries do not support discussions
+    if library:
+        component_types = [component for component in component_types if component != 'discussion']
+
+    component_types = _filter_disabled_blocks(component_types)
+
+    # Content Libraries currently don't allow opting in to unsupported xblocks/problem types.
+    allow_unsupported = getattr(courselike, "allow_unsupported_xblocks", False)
+
+    for category in component_types:
+        authorable_variations = authorable_xblocks(allow_unsupported=allow_unsupported, name=category)
+        support_level_without_template = component_support_level(authorable_variations, category)
+        templates_for_category = []
+        component_class = _load_mixed_class(category)
+
+        if support_level_without_template:
+            # add the default template with localized display name
+            # TODO: Once mixins are defined per-application, rather than per-runtime,
+            # this should use a cms mixed-in class. (cpennington)
+            display_name = xblock_type_display_name(category, _('Blank'))  # this is the Blank Advanced problem
+            templates_for_category.append(
+                create_template_dict(display_name, category, support_level_without_template, None, 'advanced')
+            )
+            categories.add(category)
+
+        # add boilerplates
+        if hasattr(component_class, 'templates'):
+            for template in component_class.templates():
+                filter_templates = getattr(component_class, 'filter_templates', None)
+                if not filter_templates or filter_templates(template, courselike):
+                    template_id = template.get('template_id')
+                    support_level_with_template = component_support_level(
+                        authorable_variations, category, template_id
+                    )
+                    if support_level_with_template:
+                        # Tab can be 'common' 'advanced'
+                        # Default setting is common/advanced depending on the presence of markdown
+                        tab = 'common'
+                        if template['metadata'].get('markdown') is None:
+                            tab = 'advanced'
+                        hinted = template.get('hinted', False)
+
+                        templates_for_category.append(
+                            create_template_dict(
+                                _(template['metadata'].get('display_name')),    # pylint: disable=translation-of-non-string
+                                category,
+                                support_level_with_template,
+                                template_id,
+                                tab,
+                                hinted,
+                            )
+                        )
+
+        # Add any advanced problem types. Note that these are different xblocks being stored as Advanced Problems,
+        # currently not supported in libraries .
+        if category == 'problem' and not library:
+            disabled_block_names = [block.name for block in disabled_xblocks()]
+            advanced_problem_types = [advanced_problem_type for advanced_problem_type in ADVANCED_PROBLEM_TYPES
+                                      if advanced_problem_type['component'] not in disabled_block_names]
+            for advanced_problem_type in advanced_problem_types:
+                component = advanced_problem_type['component']
+                boilerplate_name = advanced_problem_type['boilerplate_name']
+
+                authorable_advanced_component_variations = authorable_xblocks(
+                    allow_unsupported=allow_unsupported, name=component
+                )
+                advanced_component_support_level = component_support_level(
+                    authorable_advanced_component_variations, component, boilerplate_name
+                )
+                if advanced_component_support_level:
+                    try:
+                        component_display_name = xblock_type_display_name(component)
+                    except PluginMissingError:
+                        log.warning('Unable to load xblock type %s to read display_name', component, exc_info=True)
+                    else:
+                        templates_for_category.append(
+                            create_template_dict(
+                                component_display_name,
+                                component,
+                                advanced_component_support_level,
+                                boilerplate_name,
+                                'advanced'
+                            )
+                        )
+                        categories.add(component)
+
+        component_templates.append({
+            "type": category,
+            "templates": templates_for_category,
+            "display_name": component_display_names[category],
+            "support_legend": create_support_legend_dict()
+        })
+
+    # Libraries do not support advanced components at this time.
+    if library:
+        return component_templates
+
+    # Check if there are any advanced modules specified in the course policy.
+    # These modules should be specified as a list of strings, where the strings
+    # are the names of the modules in ADVANCED_COMPONENT_TYPES that should be
+    # enabled for the course.
+    course_advanced_keys = courselike.advanced_modules
+    advanced_component_templates = {
+        "type": "advanced",
+        "templates": [],
+        "display_name": _("Advanced"),
+        "support_legend": create_support_legend_dict()
+    }
+    advanced_component_types = _advanced_component_types(allow_unsupported)
+    # Set component types according to course policy file
+    if isinstance(course_advanced_keys, list):
+        for category in course_advanced_keys:
+            if category in advanced_component_types.keys() and category not in categories:
+                # boilerplates not supported for advanced components
+                try:
+                    component_display_name = xblock_type_display_name(category, default_display_name=category)
+                    advanced_component_templates['templates'].append(
+                        create_template_dict(
+                            component_display_name,
+                            category,
+                            advanced_component_types[category]
+                        )
+                    )
+                    categories.add(category)
+                except PluginMissingError:
+                    # dhm: I got this once but it can happen any time the
+                    # course author configures an advanced component which does
+                    # not exist on the server. This code here merely
+                    # prevents any authors from trying to instantiate the
+                    # non-existent component type by not showing it in the menu
+                    log.warning(
+                        "Advanced component %s does not exist. It will not be added to the Studio new component menu.",
+                        category
+                    )
+    else:
+        log.error(
+            "Improper format for course advanced keys! %s",
+            course_advanced_keys
+        )
+    if len(advanced_component_templates['templates']) > 0:
+        component_templates.insert(0, advanced_component_templates)
+
+    return component_templates
+
+
+def _filter_disabled_blocks(all_blocks):
+    """
+    Filter out disabled xblocks from the provided list of xblock names.
+    """
+    disabled_block_names = [block.name for block in disabled_xblocks()]
+    return [block_name for block_name in all_blocks if block_name not in disabled_block_names]
+
+
+@login_required
+def _get_item_in_course(request, usage_key):
+    """
+    Helper method for getting the old location, containing course,
+    item, lms_link, and preview_lms_link for a given locator.
+
+    Verifies that the caller has permission to access this item.
+    """
+    # usage_key's course_key may have an empty run property
+    usage_key = usage_key.replace(course_key=modulestore().fill_in_run(usage_key.course_key))
+
+    course_key = usage_key.course_key
+
+    if not has_course_author_access(request.user, course_key):
+        raise PermissionDenied()
+
+    course = modulestore().get_course(course_key)
+    item = modulestore().get_item(usage_key, depth=1)
+    lms_link = get_lms_link_for_item(item.location)
+    preview_lms_link = get_lms_link_for_item(item.location, preview=True)
+
+    return course, item, lms_link, preview_lms_link
+
+
+@login_required
+def component_handler(request, usage_key_string, handler, suffix=''):
+    """
+    Dispatch an AJAX action to an xblock
+
+    Args:
+        usage_id: The usage-id of the block to dispatch to
+        handler (str): The handler to execute
+        suffix (str): The remainder of the url to be passed to the handler
+
+    Returns:
+        :class:`django.http.HttpResponse`: The response from the handler, converted to a
+            django response
+    """
+
+    usage_key = UsageKey.from_string(usage_key_string)
+    # Let the module handle the AJAX
+    req = django_to_webob_request(request)
+
+    asides = []
+
+    try:
+        if isinstance(usage_key, (AsideUsageKeyV1, AsideUsageKeyV2)):
+            descriptor = modulestore().get_item(usage_key.usage_key)
+            aside_instance = get_xblock_aside_instance(usage_key)
+            asides = [aside_instance] if aside_instance else []
+            resp = aside_instance.handle(handler, req, suffix)
+        else:
+            descriptor = modulestore().get_item(usage_key)
+            descriptor.xmodule_runtime = StudioEditModuleRuntime(request.user)
+            resp = descriptor.handle(handler, req, suffix)
+    except NoSuchHandlerError:
+        log.info("XBlock %s attempted to access missing handler %r", descriptor, handler, exc_info=True)
+        raise Http404
+
+    # unintentional update to handle any side effects of handle call
+    # could potentially be updating actual course data or simply caching its values
+    modulestore().update_item(descriptor, request.user.id, asides=asides)
+
+    return webob_to_django_response(resp)
