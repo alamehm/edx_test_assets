@@ -46,8 +46,8 @@ CONTAINER_TEMPLATES = [
     "editor-mode-button", "upload-dialog",
     "add-xblock-component", "add-xblock-component-button", "add-xblock-component-menu",
     "add-xblock-component-support-legend", "add-xblock-component-support-level", "add-xblock-component-menu-problem",
-    "xblock-string-field-editor", "xblock-access-editor", "publish-xblock", "publish-history",
-    "unit-outline", "container-message", "container-access", "license-selector",
+    "xblock-string-field-editor", "publish-xblock", "publish-history",
+    "unit-outline", "container-message", "license-selector",
 ]
 
 
@@ -150,7 +150,6 @@ def container_handler(request, usage_key_string):
                 index += 1
 
             return render_to_response('container.html', {
-                'language_code': request.LANGUAGE_CODE,
                 'context_course': course,  # Needed only for display of menus at top of page.
                 'action': action,
                 'xblock': xblock,
@@ -241,7 +240,7 @@ def get_component_templates(courselike, library=False):
         'discussion': _("Discussion"),
         'html': _("HTML"),
         'problem': _("Problem"),
-        'video': _("Video")        
+        'video': _("Video")
     }
 
     component_templates = []
@@ -252,7 +251,7 @@ def get_component_templates(courselike, library=False):
 
     # Libraries do not support discussions
     if library:
-        component_types = [component for component in component_types if component != 'discussion']
+       component_types = [component for component in component_types if component != 'discussion']
 
     component_types = _filter_disabled_blocks(component_types)
 
@@ -346,6 +345,7 @@ def get_component_templates(courselike, library=False):
     # Libraries do not support advanced components at this time.
     if library:
         return component_templates
+# TODO remove the lines up 
 
     # Check if there are any advanced modules specified in the course policy.
     # These modules should be specified as a list of strings, where the strings
